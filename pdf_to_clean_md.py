@@ -19,10 +19,16 @@ Instalação (uma vez só):
     pip install pymupdf4llm                            # demais ambientes
 
 Uso:
-    python3 pdf_to_clean_md.py entrada.pdf saida.md
+    python3 pdf_to_clean_md.py entrada.pdf saida.md [--manter-backup] [--idioma pt|en|es|auto]
+
+    --idioma auto  : detecta o idioma automaticamente pelas primeiras páginas
+                     do PDF (padrão quando --idioma é omitido).
+    --idioma pt|en|es : força um idioma específico (útil como override manual).
+    --manter-backup   : também salva o arquivo .txt com OCR de página inteira.
 
 Exemplo:
     python3 pdf_to_clean_md.py nxwpex.pdf nxwpex_limpo.md
+    python3 pdf_to_clean_md.py manual_en.pdf manual_en.md --idioma en
 
 Limitações conhecidas (não resolvidas por este script — exigem revisão
 manual ou um modelo de IA para o trecho específico):
@@ -33,6 +39,8 @@ manual ou um modelo de IA para o trecho específico):
     podem não ser cobertos pela heurística de frequência abaixo se
     aparecerem poucas vezes (< limiar) ou com texto variável a cada
     ocorrência.
+  - PDFs totalmente escaneados sem camada de texto extraível recebem
+    idioma 'pt' como fallback na detecção automática.
 """
 import sys
 import re
@@ -77,7 +85,7 @@ IDIOMAS = {
     },
 }
 
-IDIOMA_ATUAL = 'pt'  # alterado em tempo de execução por main() conforme --idioma
+IDIOMA_ATUAL = 'pt'  # alterado em tempo de execução por main() / gui.py
 
 
 def cfg():
@@ -657,22 +665,67 @@ def limpar(raw_text: str, repeated_override=None) -> str:
     return texto_final
 
 
+def extrair_amostra_texto(caminho_pdf: str, max_paginas: int = 4) -> str:
+    """Extrai texto bruto das primeiras páginas via fitz (sem OCR) para
+    detecção de idioma. Rápido — não passa pelo pipeline completo."""
+    try:
+        import fitz
+        doc = fitz.open(caminho_pdf)
+        partes = []
+        for i, page in enumerate(doc):
+            if i >= max_paginas:
+                break
+            partes.append(page.get_text())
+        doc.close()
+        return ' '.join(partes)
+    except Exception:
+        return ''
+
+
+def detectar_idioma(texto: str) -> str:
+    """Detecta o idioma dominante do texto contando hits de stopwords de
+    cada idioma suportado. Retorna 'pt', 'en' ou 'es'.
+    Fallback para 'pt' se o texto for curto/inconclusivo."""
+    palavras = re.findall(r'[A-Za-zÀ-ÿ]+', texto.lower())
+    if not palavras:
+        return 'pt'
+    scores = {
+        lang: sum(1 for w in palavras if w in data['stopwords'])
+        for lang, data in IDIOMAS.items()
+    }
+    melhor = max(scores, key=scores.get)
+    return melhor if scores[melhor] > 0 else 'pt'
+
+
 def _configurar_tesseract():
     """Tenta localizar o executável do Tesseract automaticamente, sem exigir
-    edição manual do script. Primeiro verifica se já está no PATH; se não
-    estiver, procura nos locais de instalação padrão do Windows."""
+    edição manual do script. Ordem de busca: bundle PyInstaller → PATH →
+    locais de instalação padrão do Windows."""
+    import os as _os
     import shutil
     import pytesseract
 
-    if shutil.which('tesseract'):
-        return  # já está no PATH, pytesseract encontra sozinho
+    # 1. Modo embutido (PyInstaller): usa o Tesseract incluído no pacote
+    if getattr(sys, 'frozen', False):
+        tess_bundle = _os.path.join(sys._MEIPASS, 'Tesseract-OCR', 'tesseract.exe')
+        if _os.path.isfile(tess_bundle):
+            pytesseract.pytesseract.tesseract_cmd = tess_bundle
+            _os.environ.setdefault(
+                'TESSDATA_PREFIX',
+                _os.path.join(sys._MEIPASS, 'Tesseract-OCR'))
+            return
 
+    # 2. Já está no PATH
+    if shutil.which('tesseract'):
+        return
+
+    # 3. Locais de instalação padrão do Windows
     caminhos_comuns_windows = [
         r'C:\Program Files\Tesseract-OCR\tesseract.exe',
         r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
     ]
     for caminho in caminhos_comuns_windows:
-        if __import__('os').path.isfile(caminho):
+        if _os.path.isfile(caminho):
             pytesseract.pytesseract.tesseract_cmd = caminho
             return
 
@@ -760,24 +813,34 @@ def main():
     global IDIOMA_ATUAL
 
     if len(sys.argv) < 3:
-        print('Uso: python3 pdf_to_clean_md.py entrada.pdf saida.md [--manter-backup] [--idioma pt|en|es]')
-        print('  --manter-backup : também salva o arquivo .txt com OCR de página')
-        print('                    inteira (por padrão, só o .md é gerado).')
-        print('  --idioma pt|en|es : idioma do PDF de origem (padrão: pt).')
+        print('Uso: python3 pdf_to_clean_md.py entrada.pdf saida.md [--manter-backup] [--idioma pt|en|es|auto]')
+        print('  --manter-backup      : também salva o .txt com OCR de página inteira.')
+        print('  --idioma pt|en|es    : força um idioma específico.')
+        print('  --idioma auto        : detecta automaticamente (padrão).')
         sys.exit(1)
 
     caminho_pdf, caminho_md = sys.argv[1], sys.argv[2]
     extras = sys.argv[3:]
     manter_backup = '--manter-backup' in extras
 
+    idioma_arg = 'auto'  # padrão: detectar automaticamente
     if '--idioma' in extras:
         idx = extras.index('--idioma')
-        if idx + 1 >= len(extras) or extras[idx + 1] not in IDIOMAS:
-            print(f"Idioma inválido. Use um de: {', '.join(IDIOMAS)}")
+        if idx + 1 >= len(extras) or extras[idx + 1] not in (*IDIOMAS, 'auto'):
+            print(f"Idioma inválido. Use um de: auto, {', '.join(IDIOMAS)}")
             sys.exit(1)
-        IDIOMA_ATUAL = extras[idx + 1]
+        idioma_arg = extras[idx + 1]
 
-    print(f'[CONFIG] Idioma selecionado: {IDIOMA_ATUAL} (Tesseract: {cfg()["tesseract_lang"]})')
+    if idioma_arg == 'auto':
+        print('[CONFIG] Detectando idioma automaticamente...')
+        amostra = extrair_amostra_texto(caminho_pdf)
+        IDIOMA_ATUAL = detectar_idioma(amostra)
+        nomes = {'pt': 'Português', 'en': 'English', 'es': 'Español'}
+        print(f'[CONFIG] Idioma detectado: {nomes[IDIOMA_ATUAL]} '
+              f'(--idioma {IDIOMA_ATUAL}, Tesseract: {cfg()["tesseract_lang"]})')
+    else:
+        IDIOMA_ATUAL = idioma_arg
+        print(f'[CONFIG] Idioma (manual): {IDIOMA_ATUAL} (Tesseract: {cfg()["tesseract_lang"]})')
 
     # ETAPA 1 — extração (por página, para permitir mesclagem depois)
     paginas_brutas = extrair_por_pagina(caminho_pdf)
